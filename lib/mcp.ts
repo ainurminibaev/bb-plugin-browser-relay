@@ -68,6 +68,17 @@ export class McpHttpClient {
 
   async request(method: string, params: unknown): Promise<any> {
     const id = this.nextId++;
+    // Stop: tell the service to cancel this request too (MCP notifications/cancelled), not just stop waiting.
+    const cancel = () => { void fetch(this.url, { method: 'POST', headers: this.headers(), body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id, reason: String(this.signal?.reason ?? 'cancelled') } }), signal: AbortSignal.timeout(5_000) }).then(r => r.text()).catch(() => ''); };
+    this.signal?.addEventListener('abort', cancel, { once: true });
+    try {
+      return await this.send(id, method, params);
+    } finally {
+      this.signal?.removeEventListener('abort', cancel);
+    }
+  }
+
+  private async send(id: number, method: string, params: unknown): Promise<any> {
     const res = await fetch(this.url, { method: 'POST', headers: this.headers(), body: JSON.stringify({ jsonrpc: '2.0', id, method, params }), signal: this.signal });
     if (!res.ok) throw new Error(`MCP ${method}: HTTP ${res.status} ${(await res.text()).slice(0, 300)}`);
     const sid = res.headers.get('mcp-session-id');
@@ -84,7 +95,7 @@ export class McpHttpClient {
   }
 
   async initialize(): Promise<{ name: string; version: string }> {
-    const r = await this.request('initialize', { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'bb-browser-relay', version: '0.1.0' } });
+    const r = await this.request('initialize', { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'bb-browser-relay', version: '0.2.0' } });
     await this.notify('notifications/initialized');
     return r?.serverInfo ?? { name: 'unknown', version: '' };
   }

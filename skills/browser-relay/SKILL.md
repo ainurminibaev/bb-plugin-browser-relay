@@ -22,12 +22,20 @@ Playwright `connectOverCDP` и не ищи порт 9222: каждое тако�
 
 ```
 bb browser-relay machines                     # где служба стоит и отвечает
-bb browser-relay status [--machine <m>]       # Chrome не трогает, окна нет
+bb browser-relay status [--machine <m>]       # Chrome не трогает, окна нет; пишет, подключена ли служба к Chrome
+bb browser-relay connect [--machine <m>] [--wait 10m]  # одна попытка, одно окно «Allow», долгое ожидание без повторов
 bb browser-relay tools  [--machine <m>]       # инструменты chrome-devtools-mcp
 bb browser-relay call <tool> --args '<json>' [--machine <m>] [--timeout 120s] [--json]
 bb browser-relay service install --machine <m>   # поставить/обновить/перенести службу (macOS)
 bb browser-relay service remove  --machine <m>
+bb browser-relay stop   --thread thr_… | --all [--machine <m>]   # прервать и запретить до resume
+bb browser-relay resume --thread thr_… | --all [--machine <m>]
 ```
+
+Порядок: `status` → если «к Chrome не подключена» — один раз `connect`, скажи
+пользователю нажать «Allow» в Chrome и жди ответа команды; `call` при неподключённой
+службе отказывает с подсказкой, чтобы не плодить окна. Повторно `connect` не запускай,
+пока первая не ответила.
 
 Частые вызовы: `list_pages`, `select_page {"pageId":N}`, `new_page {"url":"…"}`,
 `navigate_page {"url":"…"}`, `take_snapshot`, `click {"uid":"…"}`, `fill {"uid":"…","value":"…"}`,
@@ -44,6 +52,11 @@ bb browser-relay service remove  --machine <m>
   Выбранная вкладка общая для всех агентов: параллельные агенты могут мешать друг другу.
 - Окно Allow после запуска Chrome или перезапуска службы — одно; скажи пользователю
   нажать его и жди, не переподключайся в цикле.
+- Остановка: `STOPPED_BY_USER` (код 3) — тред остановлен пользователем (здесь, кнопкой
+  «Стоп» Mac Computer Use или `bb mac-computer-use stop`; список общий). Не повторяй и не
+  обходи — ни прямым подключением к Chrome, ни через `bb terminal`; сообщи пользователю.
+  Снять остановку с самого себя нельзя. `stop --all` останавливает и саму службу
+  (Codex, подключённый к ней напрямую, тоже отрезан); после `resume --all` — новое «Allow».
 - Служба ставится только на macOS (launchd). Windows и Linux — не поддерживаются.
 - Покупки, отправку сообщений, удаление и публикацию в браузере — только после явного
   подтверждения пользователя.
@@ -54,3 +67,5 @@ bb browser-relay service remove  --machine <m>
   `~/Library/Logs/bb-browser-relay.log` на той машине.
 - «прежняя метка» → `service install` переносит старую службу (одно новое Allow).
 - Вызов висит → в Chrome ждёт окно Allow; попроси пользователя нажать.
+- `status` пишет «служба ждёт «Allow» только 60 с» → `service install` (служба
+  перезапустится, после этого одно новое «Allow»).

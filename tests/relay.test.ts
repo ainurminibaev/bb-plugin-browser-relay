@@ -50,7 +50,7 @@ test('generated files', () => {
 });
 
 const up = (id: string, name: string, serviceUp: boolean): MachineInfo => ({ id, name, connected: true, error: null,
-  status: { platform: 'darwin', supported: true, serviceUp, serviceError: null, installed: true, running: serviceUp, legacyLabels: [], codexPointsHere: true, serverVersion: null } });
+  status: { platform: 'darwin', supported: true, serviceUp, serviceError: null, installed: true, running: serviceUp, legacyLabels: [], codexPointsHere: true, serverVersion: null, chromeConnected: serviceUp, chromeDetail: '', longConnectWait: true, stopped: [] } });
 
 test('machine choice never guesses between several', () => {
   const mac = up('host_mac', 'MacBook Pro', true), mini = up('host_mini', 'Mac mini', true), linux = up('host_tru', 'Tru', false);

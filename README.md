@@ -34,7 +34,27 @@ bb browser-relay tools    [--machine <ID|имя>]
 bb browser-relay call <tool> --args '<json>' [--machine <ID|имя>] [--timeout 120s] [--json]
 bb browser-relay service install --machine <ID|имя>
 bb browser-relay service remove  --machine <ID|имя>
+bb browser-relay connect  [--machine <ID|имя>] [--wait 10m]
+bb browser-relay stop     --thread thr_… | --all [--machine <ID|имя>]
+bb browser-relay resume   --thread thr_… | --all [--machine <ID|имя>]
 ```
+
+- `status` показывает не только «служба отвечает», но и **подключена ли она к Chrome**
+  (по сокетам процесса службы — новое подключение не открывается, окна нет), а также
+  остановленные треды.
+- `connect` — одна попытка подключения и одно окно «Allow» с долгим ожиданием
+  (по умолчанию 10 мин), без повторов; вторая `connect` во время ожидания
+  присоединяется к первой. `call` при неподключённой службе отказывает с подсказкой.
+  chrome-devtools-mcp 1.13 сам бросает попытку через 60 с и закрывает её, поэтому
+  `service install` увеличивает это ожидание в установленной закреплённой версии до 10 мин
+  (отмена со стороны клиента попытку не бросает).
+- `stop --thread` прерывает вызовы треда в полёте (и просит службу отменить запрос),
+  отказывает его новым вызовам до `resume`, останавливает ход треда в BB, а сообщения
+  агентов и автоматизаций этому треду ждут возобновления. Список остановок общий с
+  Mac Computer Use (`~/Library/Application Support/bb-agent-stop/stopped-threads.json`):
+  остановка там блокирует и браузер, и наоборот. Тред не может снять остановку сам с себя.
+  `stop --all` запрещает все вызовы и останавливает саму службу — так отрезаются и
+  агенты, подключённые к ней напрямую (Codex); после `resume --all` — одно новое «Allow».
 
 ### Какая машина
 
@@ -53,8 +73,8 @@ bb browser-relay service install --machine <Mac с Chrome>
 ```
 
 Нужны на Mac: Node.js ≥ 20.19 и [uv](https://docs.astral.sh/uv/) (для `mcp-proxy` 0.15.0).
-Один раз в Chrome включить `chrome://inspect/#remote-debugging`. При первом обращении
-агента нажать «Allow». `service install` идемпотентен: повторный запуск проверяет и
+Один раз в Chrome включить `chrome://inspect/#remote-debugging`. После запуска Chrome —
+`bb browser-relay connect` и одно нажатие «Allow». `service install` идемпотентен: повторный запуск проверяет и
 доустанавливает. Прежние службы (`chrome-devtools-mcp-shared` под любой меткой)
 переносятся автоматически — Chrome один раз спросит «Allow».
 

@@ -9,6 +9,7 @@ import {
   CHROME_FLAGS, LABEL, LEGACY_DIR_NAMES, MCP_PROXY_VERSION, SERVICE_URL, codexEntry, codexPointsHere, isLegacyAgent,
   launchdPlist, nodeOk, parseNodeVersion, paths, runScript, withCodexEntry, withoutCodexEntry, type Paths,
 } from './lib/service';
+import { ALL, CONNECT_WAIT_MS, Inflight, addStop, connectedToPort, descendants, launchdPid, parseActivePort, patchToolHandler, readStops, refusal, removeStop, sharedStopFile, toAbort } from './lib/stop';
 import servicePackage from './service/package.json' with { type: 'json' };
 import serviceLock from './service/package-lock.json' with { type: 'json' };
 
@@ -69,15 +70,43 @@ async function probe(signal?: AbortSignal): Promise<{ version: string | null; er
   }
 }
 
+const STOP_FILE = () => sharedStopFile(homedir());
+const toolHandlerFile = (p: Paths) => `${p.installDir}/node_modules/chrome-devtools-mcp/out/Default/gen/src/ToolHandler.js`;
+
+/** Does the service hold a DevTools connection to Chrome? Looks at its sockets only: no new connection, no «Allow». */
+async function chromeConnection(): Promise<{ connected: boolean | null; detail: string }> {
+  if (!isMac()) return { connected: null, detail: 'проверка подключения к Chrome есть только на macOS' };
+  const port = parseActivePort(await readText(`${homedir()}/Library/Application Support/Google/Chrome/DevToolsActivePort`));
+  if (!port) return { connected: false, detail: 'Chrome не запущен или удалённая отладка выключена (chrome://inspect/#remote-debugging)' };
+  const root = launchdPid((await run('launchctl', ['print', `gui/${uid()}/${LABEL}`], { timeout: 10_000 })).out);
+  if (!root) return { connected: false, detail: 'служба не запущена' };
+  const pids = [root, ...descendants((await run('/bin/ps', ['-A', '-o', 'pid=,ppid='], { timeout: 10_000 })).out, root)];
+  const lsof = await run('/usr/sbin/lsof', ['-nP', '-iTCP', '-sTCP:ESTABLISHED', '-a', '-p', pids.join(',')], { timeout: 15_000 });
+  return connectedToPort(lsof.out, port)
+    ? { connected: true, detail: `подключена к Chrome (порт ${port})` }
+    : { connected: false, detail: 'к Chrome не подключена: нужна команда `bb browser-relay connect` и одно «Allow» в Chrome' };
+}
+
+async function longConnectWait(p: Paths): Promise<boolean | null> {
+  const src = await readText(toolHandlerFile(p));
+  if (src === null) return null;
+  const r = patchToolHandler(src);
+  return r.found ? !r.changed : null;
+}
+
 async function status(): Promise<RelayStatus> {
   const p = P();
   if (!isMac()) {
     // Not supported for install, but a service someone runs by hand still counts.
     const pr = await probe();
-    return { platform: platform(), supported: false, serviceUp: !pr.error, serviceError: pr.error, installed: false, running: false, legacyLabels: [], codexPointsHere: false, serverVersion: pr.version };
+    return { platform: platform(), supported: false, serviceUp: !pr.error, serviceError: pr.error, installed: false, running: false, legacyLabels: [], codexPointsHere: false, serverVersion: pr.version, chromeConnected: null, chromeDetail: 'проверка подключения к Chrome есть только на macOS', longConnectWait: null, stopped: Object.keys(await readStops(STOP_FILE())) };
   }
-  const [pr, legacy, installed, toml] = await Promise.all([probe(), legacyAgents(p), exists(p.plist), readText(p.codexConfig)]);
+  const [pr, legacy, installed, toml, chrome, wait, stops] = await Promise.all([probe(), legacyAgents(p), exists(p.plist), readText(p.codexConfig), chromeConnection(), longConnectWait(P()), readStops(STOP_FILE())]);
   return {
+    chromeConnected: pr.error ? false : chrome.connected,
+    chromeDetail: pr.error ? 'служба не отвечает' : chrome.detail,
+    longConnectWait: wait,
+    stopped: Object.keys(stops),
     platform: 'darwin',
     supported: true,
     serviceUp: !pr.error,
@@ -122,6 +151,13 @@ async function install(): Promise<{ ok: boolean; log: string }> {
     const r = await run(`${nodeDir}/npm`, ['ci', '--omit=dev', '--no-audit', '--no-fund'], { cwd: p.installDir, env, timeout: 600_000 });
     if (r.code !== 0) return { ok: false, log: [...log, r.out.slice(-2000)].join('\n') };
   }
+
+  // chrome-devtools-mcp drops a pending «Allow» after 60 s: let one attempt wait long enough.
+  const th = toolHandlerFile(p);
+  const src = await readText(th);
+  const patch = src === null ? null : patchToolHandler(src);
+  if (patch?.changed) { await writeFile(th, patch.text); changed = true; log.push(`chrome-devtools-mcp: одно подключение ждёт «Allow» до ${CONNECT_WAIT_MS / 60_000} мин (вместо 60 с).`); }
+  else if (!patch?.found) log.push('chrome-devtools-mcp: строка таймаута подключения не найдена — «Allow» нужно нажать в течение 60 с.');
 
   const want = `mcp-proxy ${MCP_PROXY_VERSION}`;
   const have = (await exists(p.mcpProxy)) ? (await run(p.mcpProxy, ['--version'], { timeout: 20_000 })).out.trim() : '';
@@ -195,6 +231,68 @@ async function remove(): Promise<{ ok: boolean; log: string }> {
   return { ok: true, log: log.join('\n') };
 }
 
+// ---- Stop: calls in flight by thread, watched against the shared stop list ----
+
+const inflight = new Inflight();
+let watchTimer: ReturnType<typeof setInterval> | null = null;
+function watchStops(): void {
+  if (watchTimer) return;
+  watchTimer = setInterval(() => {
+    if (!inflight.count()) { clearInterval(watchTimer!); watchTimer = null; return; }
+    void readStops(STOP_FILE()).then(stops => { for (const k of toAbort(stops, inflight.keys())) inflight.abort(k, 'stopped'); }).catch(() => undefined);
+  }, 500);
+}
+
+/** Runs one tool call through the service; Stop aborts it and tells the service to cancel. */
+async function callTool(tool: string, args: Record<string, unknown>, threadId: string | null, signal: AbortSignal) {
+  const stopped = refusal(await readStops(STOP_FILE()), threadId);
+  if (stopped) return { stopped, result: null };
+  const flight = inflight.begin(threadId ?? '', signal);
+  watchStops();
+  const c = new McpHttpClient(SERVICE_URL, flight.ac.signal);
+  try {
+    await c.initialize();
+    const result = await c.request('tools/call', { name: tool, arguments: args });
+    return { stopped: null, result };
+  } catch (e) {
+    if (flight.ac.signal.aborted) return { stopped: refusal(await readStops(STOP_FILE()), threadId) ?? 'CANCELLED: вызов отменён.', result: null };
+    throw e;
+  } finally {
+    flight.done();
+    await c.close();
+  }
+}
+
+let pendingConnect: Promise<{ ok: boolean; connected: boolean; text: string }> | null = null;
+
+/** One attempt, one «Allow»: never retried here; a second `connect` joins the pending one. */
+async function connect(waitMs: number, threadId: string | null, signal: AbortSignal): Promise<{ ok: boolean; connected: boolean; text: string }> {
+  const before = await chromeConnection();
+  if (before.connected) return { ok: true, connected: true, text: `Служба уже ${before.detail}. Окна «Allow» не будет.` };
+  if (pendingConnect) return pendingConnect;
+  pendingConnect = (async () => {
+    const wait = await longConnectWait(P());
+    const note = wait ? '' : ' Служба ещё старой установки: chrome-devtools-mcp бросает попытку через 60 с — выполните `bb browser-relay service install`, чтобы ждать дольше.';
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort('timeout'), waitMs);
+    const onAbort = () => ac.abort('cancelled');
+    signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      const r = await callTool('list_pages', {}, threadId, ac.signal).catch((e: any) => ({ stopped: null, result: null, error: String(e?.message ?? e) }));
+      const after = await chromeConnection();
+      if (!after.connected && ac.signal.reason === 'timeout') return { ok: false, connected: false, text: `«Allow» не нажат за ${Math.round(waitMs / 1000)} с. Попытка в службе ещё ждёт${wait ? ` до ${CONNECT_WAIT_MS / 60_000} мин` : ''}: если окно «Allow» открыто в Chrome, нажмите его; новых попыток не делаю.${note}` };
+      if (r.stopped) return { ok: false, connected: !!after.connected, text: r.stopped };
+      if (after.connected || (r.result && !r.result.isError)) return { ok: true, connected: true, text: `Подключено к Chrome. Дальше окон «Allow» нет до перезапуска Chrome или службы.${note}` };
+      const why = 'error' in r ? r.error : r.result?.isError ? renderContent((r.result.content ?? []) as ToolContent[], 2000).text : 'нет ответа';
+      return { ok: false, connected: false, text: `Не подключено: ${why}. Повторять сразу не нужно: если окно «Allow» ещё открыто в Chrome, нажмите его; иначе запустите connect снова один раз.${note}` };
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    }
+  })().finally(() => { pendingConnect = null; });
+  return pendingConnect;
+}
+
 export default experimental_defineHostEntry({
   contract: hostContract,
   handlers: {
@@ -209,11 +307,10 @@ export default experimental_defineHostEntry({
         await c.close();
       }
     },
-    call: async ({ tool, args, maxChars }, context) => {
-      const c = new McpHttpClient(SERVICE_URL, context.signal);
-      try {
-        await c.initialize();
-        const r = await c.request('tools/call', { name: tool, arguments: args });
+    call: async ({ tool, args, maxChars, threadId }, context) => {
+      {
+        const { stopped, result: r } = await callTool(tool, args, threadId ?? null, context.signal);
+        if (stopped) return { ok: false, text: stopped, images: [] };
         const { text, images } = renderContent((r?.content ?? []) as ToolContent[], maxChars);
         const dir = `${context.experimental_paths.dataDir}/images`;
         const saved: string[] = [];
@@ -225,9 +322,28 @@ export default experimental_defineHostEntry({
           saved.push(f);
         }
         return { ok: !r?.isError, text, images: saved };
-      } finally {
-        await c.close();
       }
+    },
+    connect: async ({ waitMs, threadId }, context) => connect(waitMs, threadId ?? null, context.signal),
+    stop: async ({ key }) => {
+      await addStop(STOP_FILE(), key);
+      const aborted = inflight.abort(key, 'stopped');
+      const log = [`Остановлено: ${key === ALL ? 'все вызовы Browser Relay' : `тред ${key}`}${aborted ? `; прервано вызовов в полёте: ${aborted}` : ''}.`];
+      // Agents that talk to the service directly (Codex MCP) cannot be told apart: stopping everything stops the service itself.
+      if (key === ALL && isMac()) {
+        await run('launchctl', ['bootout', `gui/${uid()}/${LABEL}`], { timeout: 30_000 });
+        log.push('Служба остановлена: соединение с Chrome закрыто, прямые подключения (Codex) тоже отрезаны. После `resume --all` Chrome один раз спросит «Allow».');
+      }
+      return { ok: true, aborted, log: log.join('\n') };
+    },
+    resume: async ({ key }) => {
+      const had = await removeStop(STOP_FILE(), key);
+      const log = [had ? `Снята остановка: ${key === ALL ? 'все вызовы' : `тред ${key}`}.` : 'Остановки не было.'];
+      if (key === ALL && isMac() && (await exists(P().plist)) && !(await labelRunning(LABEL))) {
+        const r = await run('launchctl', ['bootstrap', `gui/${uid()}`, P().plist], { timeout: 30_000 });
+        log.push(r.code === 0 || (await labelRunning(LABEL)) ? 'Служба запущена снова; при первом обращении Chrome спросит «Allow».' : `Службу запустить не удалось: ${r.out.trim().slice(0, 300)}`);
+      }
+      return { ok: true, log: log.join('\n') };
     },
     service: async ({ action }) => (action === 'install' ? install() : remove()),
   },
